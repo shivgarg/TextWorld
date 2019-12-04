@@ -3,6 +3,7 @@
 set -e
 
 if [[ $TRAVIS_OS_NAME == "osx" ]]; then
+    brew update
     brew tap homebrew/cask
     brew cask install google-chrome chromedriver
     brew install graphviz
@@ -13,4 +14,4 @@ if [[ $TRAVIS_OS_NAME == "osx" ]]; then
 fi
 
 pip install .
-pip install nose coverage
+pip install nose coverage codecov

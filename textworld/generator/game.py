@@ -46,6 +46,7 @@ class UnderspecifiedQuestError(NameError):
 
 def gen_commands_from_actions(actions: Iterable[Action], kb: Optional[KnowledgeBase] = None) -> List[str]:
     kb = kb or KnowledgeBase.default()
+
     def _get_name_mapping(action):
         mapping = kb.rules[action.name].match(action)
         return {ph.name: var.name for ph, var in mapping.items()}
@@ -87,9 +88,25 @@ class Event:
                         to get triggered.
             commands: Human readable version of the actions.
         """
-        self.actions = tuple(actions)
-        self.commands = tuple(commands)
+        self.actions = actions
+        self.commands = commands
         self.condition = self.set_conditions(conditions)
+
+    @property
+    def actions(self) -> Iterable[Action]:
+        return self._actions
+
+    @actions.setter
+    def actions(self, actions: Iterable[Action]) -> None:
+        self._actions = tuple(actions)
+
+    @property
+    def commands(self) -> Iterable[str]:
+        return self._commands
+
+    @commands.setter
+    def commands(self, commands: Iterable[str]) -> None:
+        self._commands = tuple(commands)
 
     def is_triggering(self, state: State) -> bool:
         """ Check if this event would be triggered in a given state. """
@@ -121,15 +138,13 @@ class Event:
         return self.condition
 
     def __hash__(self) -> int:
-        return hash((tuple(self.actions),
-                     tuple(self.commands),
-                     self.condition))
+        return hash((self.actions, self.commands, self.condition))
 
     def __eq__(self, other: Any) -> bool:
-        return (isinstance(other, Event) and
-                self.actions == other.actions and
-                self.commands == other.commands and
-                self.condition == other.condition)
+        return (isinstance(other, Event)
+                and self.actions == other.actions
+                and self.commands == other.commands
+                and self.condition == other.condition)
 
     @classmethod
     def deserialize(cls, data: Mapping) -> "Event":
@@ -211,6 +226,30 @@ class Quest:
         if len(self.win_events) == 0 and len(self.fail_events) == 0:
             raise UnderspecifiedQuestError()
 
+    @property
+    def win_events(self) -> Iterable[Event]:
+        return self._win_events
+
+    @win_events.setter
+    def win_events(self, events: Iterable[Event]) -> None:
+        self._win_events = tuple(events)
+
+    @property
+    def fail_events(self) -> Iterable[Event]:
+        return self._fail_events
+
+    @fail_events.setter
+    def fail_events(self, events: Iterable[Event]) -> None:
+        self._fail_events = tuple(events)
+
+    @property
+    def commands(self) -> Iterable[str]:
+        return self._commands
+
+    @commands.setter
+    def commands(self, commands: Iterable[str]) -> None:
+        self._commands = tuple(commands)
+
     def is_winning(self, state: State) -> bool:
         """ Check if this quest is winning in that particular state. """
         return any(event.is_triggering(state) for event in self.win_events)
@@ -220,19 +259,16 @@ class Quest:
         return any(event.is_triggering(state) for event in self.fail_events)
 
     def __hash__(self) -> int:
-        return hash((tuple(self.win_events),
-                     tuple(self.fail_events),
-                     self.reward,
-                     self.desc,
-                     tuple(self.commands)))
+        return hash((self.win_events, self.fail_events, self.reward,
+                     self.desc, self.commands))
 
     def __eq__(self, other: Any) -> bool:
-        return (isinstance(other, Quest) and
-                self.win_events == other.win_events and
-                self.fail_events == other.fail_events and
-                self.reward == other.reward and
-                self.desc == other.desc,
-                self.commands == other.commands)
+        return (isinstance(other, Quest)
+                and self.win_events == other.win_events
+                and self.fail_events == other.fail_events
+                and self.reward == other.reward
+                and self.desc == other.desc
+                and self.commands == other.commands)
 
     @classmethod
     def deserialize(cls, data: Mapping) -> "Quest":
@@ -296,9 +332,9 @@ class EntityInfo:
         self.room_type = None
 
     def __eq__(self, other: Any) -> bool:
-        return (isinstance(other, EntityInfo) and
-                all(getattr(self, slot) == getattr(other, slot)
-                    for slot in self.__slots__))
+        return (isinstance(other, EntityInfo)
+                and all(getattr(self, slot) == getattr(other, slot)
+                        for slot in self.__slots__))
 
     def __hash__(self) -> int:
         return hash(tuple(getattr(self, slot) for slot in self.__slots__))
@@ -378,9 +414,10 @@ class Game:
 
     def copy(self) -> "Game":
         """ Make a shallow copy of this game. """
-        game = Game(self.world, self.grammar, self.quests)
+        game = Game(self.world, None, self.quests)
         game._infos = dict(self.infos)
         game._objective = self._objective
+        game.main_quest = self.main_quest
         game.metadata = dict(self.metadata)
         game.extras = dict(self.extras)
         return game
@@ -432,12 +469,13 @@ class Game:
 
         version = data.get("version", cls._SERIAL_VERSION)
         if version != cls._SERIAL_VERSION:
-            raise ValueError("Cannot deserialize a TextWorld version {} game, expected version {}".format(version, cls._SERIAL_VERSION))
+            msg = "Cannot deserialize a TextWorld version {} game, expected version {}"
+            raise ValueError(msg.format(version, cls._SERIAL_VERSION))
 
         kb = KnowledgeBase.deserialize(data["KB"])
         world = World.deserialize(data["world"], kb=kb)
         game = cls(world)
-        game.grammar = Grammar(data["grammar"])
+        game.grammar_options = GrammarOptions(data["grammar"])
         game.quests = tuple([Quest.deserialize(d) for d in data["quests"]])
         game._infos = {k: EntityInfo.deserialize(v) for k, v in data["infos"]}
         game.metadata = data.get("metadata", {})
@@ -470,13 +508,13 @@ class Game:
         return data
 
     def __eq__(self, other: Any) -> bool:
-        return (isinstance(other, Game) and
-                self.world == other.world and
-                self.infos == other.infos and
-                self.quests == other.quests and
-                self.extras == other.extras and
-                self.main_quest == other.main_quest and
-                self._objective == other._objective)
+        return (isinstance(other, Game)
+                and self.world == other.world
+                and self.infos == other.infos
+                and self.quests == other.quests
+                and self.extras == other.extras
+                and self.main_quest == other.main_quest
+                and self._objective == other._objective)
 
     def __hash__(self) -> int:
         state = (self.world,

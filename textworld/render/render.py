@@ -11,8 +11,8 @@ from typing import Union, Dict, Optional
 import numpy as np
 import networkx as nx
 
+from textworld.core import GameState
 from textworld.logic import Proposition, Action
-from textworld.envs.glulx.git_glulx_ml import GlulxGameState
 from textworld.logic import State
 from textworld.generator import World, Game
 from textworld.utils import maybe_mkdir, get_webdriver
@@ -88,7 +88,7 @@ class GraphRoom(object):
         self.items.append(item)
 
 
-def load_state_from_game_state(game_state: GlulxGameState, format: str = 'png', limit_player_view: bool = False) -> dict:
+def load_state_from_game_state(game_state: GameState, format: str = 'png', limit_player_view: bool = False) -> dict:
     """
     Generates serialization of game state.
 
@@ -97,11 +97,11 @@ def load_state_from_game_state(game_state: GlulxGameState, format: str = 'png', 
     :param limit_player_view: Whether to limit the player's view. Default: False.
     :return: The graph generated from this World
     """
-    game_infos = game_state.game_infos
+    game_infos = game_state.game.infos
     game_infos["objective"] = game_state.objective
-    last_action = game_state.action
+    last_action = game_state.last_action
     # Create a world from the current state's facts.
-    world = World.from_facts(game_state.state.facts)
+    world = World.from_facts(game_state._facts)
     return load_state(world, game_infos, last_action, format, limit_player_view)
 
 
@@ -124,8 +124,12 @@ def temp_viz(nodes, edges, pos, color=[]):
                                    alpha=0.8)
     plt.show()
 
-# create state object from world and game_info
-def load_state(world: World, game_infos: Optional[Dict[str, EntityInfo]] = None, action: Optional[Action] = None, format: str = 'png', limit_player_view: bool = False) -> dict:
+
+def load_state(world: World,
+               game_infos: Optional[Dict[str, EntityInfo]] = None,
+               action: Optional[Action] = None,
+               format: str = 'png',
+               limit_player_view: bool = False) -> dict:
     """
     Generates serialization of game state.
 
@@ -143,7 +147,6 @@ def load_state(world: World, game_infos: Optional[Dict[str, EntityInfo]] = None,
         room = world.player_room
 
     edges = []
-    nodes = sorted([room.name for room in world.rooms])
     pos = {room.name: (0, 0)}
 
     def used_pos():
@@ -214,9 +217,7 @@ def load_state(world: World, game_infos: Optional[Dict[str, EntityInfo]] = None,
             edges.append((room.name, target.name, room.doors.get(exit)))
             # temp_viz(nodes, edges, pos, color=[world.player_room.name])
 
-
     rooms = {}
-    player_room = world.player_room
     if game_infos is None:
         new_game = Game(world)
         game_infos = new_game.infos
@@ -296,20 +297,22 @@ def load_state(world: World, game_infos: Optional[Dict[str, EntityInfo]] = None,
         room.base_room = temp
         result["rooms"].append(room.__dict__)
 
-
     def _get_door(door):
         if door is None:
             return None
 
         return all_items[door.name].__dict__
 
-    result["connections"] = [{"src": game_infos[e[0]].name, "dest": game_infos[e[1]].name, 'door': _get_door(e[2])} for e in edges]
+    def _get_name(entity):
+        return game_infos[entity].name
+    result["connections"] = [{"src": _get_name(e[0]), "dest": _get_name(e[1]), "door": _get_door(e[2])}
+                             for e in edges]
     result["inventory"] = [inv.__dict__ for inv in inventory_items]
 
     return result
 
 
-def take_screenshot(url: str, id: str='world'):
+def take_screenshot(url: str, id: str = 'world'):
     """
     Takes a screenshot of DOM element given its id.
     :param url: URL of webpage to open headlessly.
@@ -335,6 +338,7 @@ def take_screenshot(url: str, id: str='world'):
     image = image.crop((left, top, right, bottom))
     return image
 
+
 def concat_images(*images):
     from PIL import Image
     widths, heights = zip(*(i.size for i in images))
@@ -351,7 +355,7 @@ def concat_images(*images):
     return new_im
 
 
-def visualize(world: Union[Game, State, GlulxGameState, World],
+def visualize(world: Union[Game, State, GameState, World],
               interactive: bool = False):
     """
     Show the current state of the world.
@@ -369,7 +373,7 @@ def visualize(world: Union[Game, State, GlulxGameState, World],
         game = world
         state = load_state(game.world, game.infos)
         state["objective"] = game.objective
-    elif isinstance(world, GlulxGameState):
+    elif isinstance(world, GameState):
         state = load_state_from_game_state(game_state=world)
     elif isinstance(world, World):
         state = load_state(world)

@@ -2,12 +2,11 @@
 # Licensed under the MIT license.
 
 
-from collections import Counter, defaultdict, deque, namedtuple
+from collections import Counter, defaultdict, deque
 from functools import total_ordering, lru_cache
-import re
 from tatsu.model import NodeWalker
 import textwrap
-from typing import Callable, Container, Dict, Iterable, List, Mapping, Optional, Set, Sequence
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Set, Sequence
 
 try:
     from typing import Collection
@@ -18,6 +17,8 @@ except ImportError:
 from textworld.logic.model import GameLogicModelBuilderSemantics
 from textworld.logic.parser import GameLogicParser
 from textworld.utils import uniquify, unique_product
+
+from mementos import memento_factory, with_metaclass
 
 
 # We use first-order logic to represent the state of the world, and the actions
@@ -202,6 +203,7 @@ class _ModelConverter(NodeWalker):
 
 _PARSER = GameLogicParser(semantics=GameLogicModelBuilderSemantics(), parseinfo=True)
 
+
 def _parse_and_convert(*args, **kwargs):
     model = _PARSER.parse(*args, **kwargs)
     return _ModelConverter().walk(model)
@@ -316,6 +318,7 @@ class TypeHierarchy:
     def __init__(self):
         self._types = {}
         self._children = defaultdict(list)
+        self._cache = {}
 
     def add(self, type: Type):
         if type.name in self._types:
@@ -328,6 +331,9 @@ class TypeHierarchy:
             children = self._children[parent]
             children.append(type.name)
             children.sort()
+
+        # Adding a new type invalidates the cache.
+        self._cache = {}
 
     def get(self, name: str) -> Type:
         return self._types[name]
@@ -435,13 +441,16 @@ class TypeHierarchy:
         """
         return self.multi_closure(types, lambda t: t.child_types)
 
-    def multi_subtypes(self, types: Collection[Type]) -> Iterable[Collection[Type]]:
+    def multi_subtypes(self, types: Collection[Type]) -> List[Collection[Type]]:
         """
         Computes the descendant closure of a sequence of types, including the
         initial types.
         """
-        yield tuple(types)
-        yield from self.multi_descendants(types)
+        types = tuple(types)
+        if types not in self._cache:
+            self._cache[types] = [types] + list(self.multi_descendants(types))
+
+        return self._cache[types]
 
 
 @total_ordering
@@ -522,8 +531,12 @@ class Variable:
         return cls(data["name"], data["type"])
 
 
+SignatureTracker = memento_factory('SignatureTracker',
+                                   lambda cls, args, kwargs: (cls, args[0] + '//'.join(args[1])))
+
+
 @total_ordering
-class Signature:
+class Signature(with_metaclass(SignatureTracker, object)):
     """
     The type signature of a Predicate or Proposition.
     """
@@ -580,8 +593,14 @@ class Signature:
         return _parse_and_convert(expr, rule_name="onlySignature")
 
 
+PropositionTracker = memento_factory('PropositionTracker',
+                                     lambda cls, args, kwargs: (
+                                         cls,
+                                         args[0] + '//'.join(v.name for v in args[1]) if len(args) == 2 else ""))
+
+
 @total_ordering
-class Proposition:
+class Proposition(with_metaclass(PropositionTracker, object)):
     """
     An instantiated Predicate, with concrete variables for each placeholder.
     """
@@ -924,7 +943,12 @@ class Action:
         self._pre_set = frozenset(self.preconditions)
         self._post_set = frozenset(self.postconditions)
 
-        self.variables = tuple(uniquify(var for prop in self.all_propositions for var in prop.arguments))
+    @property
+    def variables(self):
+        if not hasattr(self, "_variables"):
+            self._variables = tuple(uniquify(var for prop in self.all_propositions for var in prop.arguments))
+
+        return self._variables
 
     @property
     def all_propositions(self) -> Collection[Proposition]:
@@ -1037,6 +1061,8 @@ class Rule:
         """
 
         self.name = name
+        self.template = None
+        self._cache = {}
         self.preconditions = tuple(preconditions)
         self.postconditions = tuple(postconditions)
 
@@ -1133,9 +1159,18 @@ class Rule:
         The instantiated Action with each Placeholder mapped to the corresponding Variable.
         """
 
+        key = tuple(mapping[ph] for ph in self.placeholders)
+        if key in self._cache:
+            return self._cache[key]
+
         pre_inst = [pred.instantiate(mapping) for pred in self.preconditions]
         post_inst = [pred.instantiate(mapping) for pred in self.postconditions]
-        return Action(self.name, pre_inst, post_inst)
+        action = Action(self.name, pre_inst, post_inst)
+        if self.template:
+            action.template = self.template.format(**{ph.name: "{{{}}}".format(var.name) for ph, var in mapping.items()})
+
+        self._cache[key] = action
+        return action
 
     def match(self, action: Action) -> Optional[Mapping[Placeholder, Variable]]:
         """
@@ -1262,7 +1297,7 @@ class Inform7Logic:
 
     def _initialize(self, logic):
         self._expand_predicates(logic)
-        self._expand_commands(logic)
+        self._initialize_commands(logic)
 
     def _expand_predicates(self, logic):
         for sig, pred in list(self.predicates.items()):
@@ -1273,18 +1308,13 @@ class Inform7Logic:
                 expanded = pred.predicate.substitute(mapping)
                 self._add_predicate(Inform7Predicate(expanded, pred.source))
 
-    def _expand_commands(self, logic):
+    def _initialize_commands(self, logic):
         for name, command in list(self.commands.items()):
             rule = logic.rules.get(name)
             if not rule:
                 continue
 
-            types = [logic.types.get(ph.type) for ph in rule.placeholders]
-            descendants = logic.types.multi_descendants(types)
-            for descendant in descendants:
-                type_names = [type.name for type in descendant]
-                expanded_name = name + "-" + "-".join(type_names)
-                self._add_command(Inform7Command(expanded_name, command.command, command.event))
+            rule.template = command.command
 
 
 class GameLogic:
@@ -1310,12 +1340,12 @@ class GameLogic:
         self.predicates.add(signature)
 
     def _add_alias(self, alias: Alias):
-       sig = alias.pattern.signature
-       if sig in self.aliases:
-           raise ValueError("Duplicate alias {}".format(alias))
-       if sig in self.predicates:
-           raise ValueError("Alias {} is also a predicate".format(alias))
-       self.aliases[sig] = alias
+        sig = alias.pattern.signature
+        if sig in self.aliases:
+            raise ValueError("Duplicate alias {}".format(alias))
+        if sig in self.predicates:
+            raise ValueError("Alias {} is also a predicate".format(alias))
+        self.aliases[sig] = alias
 
     def _add_rule(self, rule: Rule):
         if rule.name in self.rules:
@@ -1615,7 +1645,8 @@ class State:
         state.apply(action)
         return state
 
-    def all_applicable_actions(self, rules: Iterable[Rule], mapping: Mapping[Placeholder, Variable] = None) -> Iterable[Action]:
+    def all_applicable_actions(self, rules: Iterable[Rule],
+                               mapping: Mapping[Placeholder, Variable] = None) -> Iterable[Action]:
         """
         Get all the rule instantiations that would be valid actions in this state.
 
@@ -1635,9 +1666,9 @@ class State:
             yield from self.all_instantiations(rule, mapping)
 
     def all_instantiations(self,
-        rule: Rule,
-        mapping: Mapping[Placeholder, Variable] = None
-    ) -> Iterable[Action]:
+                           rule: Rule,
+                           mapping: Mapping[Placeholder, Variable] = None
+                           ) -> Iterable[Action]:
         """
         Find all possible actions that can be instantiated from a rule in this state.
 
@@ -1657,11 +1688,11 @@ class State:
             yield rule.instantiate(assignment)
 
     def all_assignments(self,
-        rule: Rule,
-        mapping: Mapping[Placeholder, Optional[Variable]] = None,
-        partial: bool = False,
-        allow_partial: Callable[[Placeholder], bool] = None,
-    ) -> Iterable[Mapping[Placeholder, Optional[Variable]]]:
+                        rule: Rule,
+                        mapping: Mapping[Placeholder, Optional[Variable]] = None,
+                        partial: bool = False,
+                        allow_partial: Callable[[Placeholder], bool] = None,
+                        ) -> Iterable[Mapping[Placeholder, Optional[Variable]]]:
         """
         Find all possible placeholder assignments that would allow a rule to be instantiated in this state.
 
@@ -1711,12 +1742,12 @@ class State:
             return self._all_applicable_assignments(rule, mapping, used_vars, new_phs_by_depth, 0)
 
     def _all_applicable_assignments(self,
-        rule: Rule,
-        mapping: Dict[Placeholder, Optional[Variable]],
-        used_vars: Set[Variable],
-        new_phs_by_depth: List[List[Placeholder]],
-        depth: int,
-    ) -> Iterable[Mapping[Placeholder, Optional[Variable]]]:
+                                    rule: Rule,
+                                    mapping: Dict[Placeholder, Optional[Variable]],
+                                    used_vars: Set[Variable],
+                                    new_phs_by_depth: List[List[Placeholder]],
+                                    depth: int,
+                                    ) -> Iterable[Mapping[Placeholder, Optional[Variable]]]:
         """
         Find all assignments that would be applicable in this state.  We recurse through the rule's preconditions, at
         each level determining possible variable assignments from the current facts.
@@ -1753,18 +1784,18 @@ class State:
                     used_vars.discard(var)
 
     def _all_assignments(self,
-        placeholders: List[Placeholder],
-        mapping: Dict[Placeholder, Variable],
-        used_vars: Set[Variable],
-        partial: bool,
-        allow_partial: Callable[[Placeholder], bool] = None,
-    ) -> Iterable[Mapping[Placeholder, Optional[Variable]]]:
+                         placeholders: List[Placeholder],
+                         mapping: Dict[Placeholder, Variable],
+                         used_vars: Set[Variable],
+                         partial: bool,
+                         allow_partial: Callable[[Placeholder], bool] = None,
+                         ) -> Iterable[Mapping[Placeholder, Optional[Variable]]]:
         """
         Find all possible assignments of the given placeholders, without regard to whether any predicates match.
         """
 
         if allow_partial is None:
-            allow_partial = lambda ph: True
+            allow_partial = lambda ph: True  # noqa: E731
 
         candidates = []
         for ph in placeholders:
